@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::de::DeserializeOwned;
 use std::convert::TryFrom;
 use std::io::{ErrorKind, Read, Write};
@@ -76,11 +76,19 @@ impl Connection {
         hello_buf[i + 1] = env!("CARGO_PKG_VERSION_MINOR").parse().unwrap();
         hello_buf[i + 2] = env!("CARGO_PKG_VERSION_PATCH").parse().unwrap();
 
-        socket.write_all(&hello_buf)?;
+        socket
+            .write_all(&hello_buf)
+            .context("could not send writer-hello")?;
 
         // Read the benchmark hello message.
         let mut hello_buf = [0u8; BENCHMARK_HELLO_SIZE];
-        socket.read_exact(&mut hello_buf)?;
+        loop {
+            match socket.read_exact(&mut hello_buf) {
+                Ok(_) => break,
+                Err(err) if err.kind() == ErrorKind::WouldBlock => {}
+                Err(err) => return Err(anyhow!(err)),
+            }
+        }
 
         if &hello_buf[0..BENCHMARK_MAGIC_NUMBER.len()] != BENCHMARK_MAGIC_NUMBER.as_bytes() {
             return Err(
@@ -114,16 +122,25 @@ impl Connection {
     /// Ok(None).
     pub fn recv<T: DeserializeOwned>(&mut self) -> Result<Option<T>> {
         let mut length_buf = [0u8; 4];
-        match self.socket.read_exact(&mut length_buf) {
-            Err(err) if err.kind() == ErrorKind::UnexpectedEof => return Ok(None),
-            Err(err) => return Err(err.into()),
-            Ok(val) => val,
-        };
+        loop {
+            match self.socket.read_exact(&mut length_buf) {
+                Err(err) if err.kind() == ErrorKind::UnexpectedEof => return Ok(None),
+                Err(err) if err.kind() == ErrorKind::WouldBlock => {}
+                Err(err) => return Err(err.into()),
+                Ok(_val) => break,
+            };
+        }
         let length = u32::from_be_bytes(length_buf);
         self.receive_buffer.resize(length as usize, 0u8);
-        self.socket
-            .read_exact(&mut self.receive_buffer)
-            .context("Failed to read message from Criterion.rs benchmark")?;
+        loop {
+            match self.socket.read_exact(&mut self.receive_buffer) {
+                Ok(_) => break,
+                Err(err) if err.kind() == ErrorKind::WouldBlock => {}
+                Err(err) => {
+                    return Err(err).context("Failed to read message from Criterion.rs benchmark")
+                }
+            }
+        }
         let value: T = serde_cbor::from_slice(&self.receive_buffer)
             .context("Failed to parse message from Criterion.rs benchmark")?;
         Ok(Some(value))
